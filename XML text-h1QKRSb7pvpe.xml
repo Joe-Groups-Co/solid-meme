@@ -1,0 +1,823 @@
+#!/usr/bin/env bash
+# run-git-advanced-on-SetupOrion.sh
+# Demo: git stash, cherry-pick, revert, reset inside an existing clone of fairul68/SetupOrion
+# Usage: bash run-git-advanced-on-SetupOrion.sh
+# Safety: Run in a throwaway clone. Script will create branches and commits locally but will NOT push.
+
+set -euo pipefail
+
+# Helpers
+run() {
+  echo -e "\n$ $*"
+  "$@"
+}
+run_allow_fail() {
+  echo -e "\n$ $*"
+  if "$@"; then
+    :
+  else
+    echo "== Command exited non-zero (expected in some scenarios) =="
+  fi
+}
+
+# Basic checks
+if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  echo "ERROR: not inside a git repository. cd into your local clone of fairul68/SetupOrion and rerun."
+  exit 1
+fi
+
+# Verify remote is fairul68/SetupOrion
+ORIGIN_URL="$(git config --get remote.origin.url || true)"
+if [ -z "$ORIGIN_URL" ]; then
+  echo "ERROR: no 'origin' remote configured. Please run this in a clone of fairul68/SetupOrion."
+  exit 1
+fi
+
+# Normalize to check repo name presence
+if [[ "$ORIGIN_URL" != *"fairul68/SetupOrion"* && "$ORIGIN_URL" != *":fairul68/SetupOrion.git"* && "$ORIGIN_URL" != *"/fairul68/SetupOrion.git"* ]]; then
+  echo "ERROR: remote origin does not look like fairul68/SetupOrion:"
+  echo "  origin: $ORIGIN_URL"
+  echo "This script will only run against the fairul68/SetupOrion repo to avoid accidental edits."
+  exit 1
+fi
+
+# Ensure working tree is clean unless user overrides
+if [ -n "$(git status --porcelain)" ] && [ "${SKIP_CLEAN_CHECK:-0}" != "1" ]; then
+  echo "ERROR: working tree is not clean. Commit or stash changes before running, or set SKIP_CLEAN_CHECK=1 to override."
+  git status --short
+  exit 1
+fi
+
+# Determine default branch name (remote HEAD)
+DEFAULT_BRANCH="$(git remote show origin 2>/dev/null | awk -F': ' '/HEAD branch/ {print $2}')"
+if [ -z "$DEFAULT_BRANCH" ]; then
+  # fallback guesses
+  if git show-ref --verify --quiet refs/heads/main; then
+    DEFAULT_BRANCH="main"
+  elif git show-ref --verify --quiet refs/heads/master; then
+    DEFAULT_BRANCH="master"
+  else
+    DEFAULT_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+  fi
+fi
+
+echo "Detected default branch: $DEFAULT_BRANCH"
+echo "Origin URL: $ORIGIN_URL"
+
+# Choose files from repository to work with
+SHELL_FILE="$(git ls-files '*.sh' | head -n 1 || true)"
+GO_FILE="$(git ls-files '*.go' | head -n 1 || true)"
+
+# If no suitable files found, create demo files under demo/ to avoid touching unrelated source.
+if [ -z "$SHELL_FILE" ] || [ -z "$GO_FILE" ]; then
+  echo "No existing .sh or .go files found in tracked files; creating demo/demo_install.sh and demo/cmd/main.go"
+  run mkdir -p demo cmd
+  SHELL_FILE="demo/demo_install.sh"
+  GO_FILE="demo/cmd/main.go"
+  if [ ! -f "$SHELL_FILE" ]; then
+    cat > "$SHELL_FILE" <<'EOF'
+#!/bin/bash
+echo "install script v1"
+EOF
+    chmod +x "$SHELL_FILE"
+    git add "$SHELL_FILE"
+  fi
+  if [ ! -f "$GO_FILE" ]; then
+    mkdir -p "$(dirname "$GO_FILE")"
+    cat > "$GO_FILE" <<'EOF'
+package main
+
+import "fmt"
+
+func main() {
+    fmt.Println("server v1")
+}
+EOF
+    git add "$GO_FILE"
+  fi
+  run git commit -m "demo(files): add demo shell and go files for local advanced-git demo" || true
+else
+  echo "Using existing files:"
+  echo "  shell file: $SHELL_FILE"
+  echo "  go file:    $GO_FILE"
+fi
+
+TIMESTAMP="$(date +%s)"
+BR_FEATURE="feature/refactor-demo-$TIMESTAMP"
+BR_HOTFIX="hotfix/demo-$TIMESTAMP"
+BR_RELEASE="release/demo-$TIMESTAMP"
+BR_CLEANUP="feature/cleanup-demo-$TIMESTAMP"
+
+echo -e "\n--- Scenario 1: git stash ---"
+run git checkout -b "$BR_FEATURE" "origin/$DEFAULT_BRANCH" || git checkout -b "$BR_FEATURE" "$DEFAULT_BRANCH"
+
+# Make tracked changes + untracked file
+echo -e "\n# refactor: demo change" >> "$SHELL_FILE"
+echo -e "\n// TODO: demo change" >> "$GO_FILE"
+UNTRACKED_FILE="scripts/demo_temp_$TIMESTAMP.sh"
+echo "# temporary helper" > "$UNTRACKED_FILE"
+chmod +x "$UNTRACKED_FILE"
+
+echo -e "\nWorking tree before stash (porcelain):"
+run git status --porcelain
+
+echo -e "\nStash including untracked files with message:"
+run git stash push -m "WIP: refactor demo $TIMESTAMP" -u
+
+echo -e "\nStash list:"
+run git stash list
+
+echo -e "\nWorking tree after stash (should be clean):"
+run git status --porcelain || true
+
+echo -e "\nSwitch to default branch and back (safe to run other checks):"
+run git checkout "$DEFAULT_BRANCH"
+run git checkout "$BR_FEATURE"
+
+echo -e "\nRestore stash (pop):"
+run git stash pop
+
+echo -e "\nStatus after pop:"
+run git status --porcelain
+run git log --oneline --graph -n 5
+
+echo -e "\n--- Scenario 2: git cherry-pick ---"
+# Create hotfix branch from default and commit a small fix to shell file
+run git checkout "$DEFAULT_BRANCH"
+run git checkout -b "$BR_HOTFIX"
+
+# Ensure we have the shell file tracked (exists)
+if [ ! -f "$SHELL_FILE" ]; then
+  echo "ERROR: shell file '$SHELL_FILE' unexpectedly missing."
+  exit 1
+fi
+
+run bash -c "cp '$SHELL_FILE' '${SHELL_FILE}.bak.$TIMESTAMP' || true"
+# Modify shell file for hotfix commit
+run bash -c "echo '# hotfix: adjust message' >> '$SHELL_FILE'"
+run git add "$SHELL_FILE"
+run git commit -m "hotfix(demo): small fix to $SHELL_FILE"
+HOTFIX_SHA="$(git rev-parse HEAD)"
+echo "Hotfix commit SHA: $HOTFIX_SHA"
+
+# Create a release branch and make a conflicting change to the same shell file
+run git checkout "$DEFAULT_BRANCH"
+run git checkout -b "$BR_RELEASE"
+run bash -c "echo '# release tweak' >> '$SHELL_FILE'"
+run git add "$SHELL_FILE"
+run git commit -m "release(demo): tweak $SHELL_FILE on release branch"
+
+echo -e "\nAttempting to cherry-pick hotfix onto release (expect conflict):"
+run_allow_fail git cherry-pick "$HOTFIX_SHA"
+
+echo -e "\nGit status after cherry-pick attempt (shows conflict when it occurs):"
+run git status --porcelain || true
+
+echo -e "\nResolving conflict by choosing cherry-picked changes (theirs) for the shell file, then continuing:"
+run git checkout --theirs -- "$SHELL_FILE"
+run git add "$SHELL_FILE"
+run git cherry-pick --continue
+
+echo -e "\nCherry-pick complete; recent log on $BR_RELEASE:"
+run git log --oneline --graph -n 6
+
+echo -e "\n--- Scenario 3: git revert ---"
+# Create a "bad" commit on default branch and revert it
+run git checkout "$DEFAULT_BRANCH"
+BAD_COMMIT_BRANCH="tmp/bad-change-$TIMESTAMP"
+run git checkout -b "$BAD_COMMIT_BRANCH"
+
+# Add a breaking line to the Go file
+run bash -c "echo '// EXPERIMENTAL: breaking' >> '$GO_FILE'"
+run git add "$GO_FILE"
+run git commit -m "experiment(demo): add breaking change to $GO_FILE"
+BAD_SHA="$(git rev-parse --short HEAD)"
+echo "Created bad commit: $BAD_SHA"
+
+echo -e "\nReverting the bad commit (non-interactive):"
+run git revert --no-edit "$(git rev-parse HEAD)"
+
+echo -e "\nLog after revert (you should see the revert commit):"
+run git log --oneline -n 6
+
+echo -e "\nDemonstrating bundled revert of multiple commits:"
+# Create two small commits then revert them together with -n
+run bash -c "echo '// temp A' >> '$GO_FILE'"
+run git add "$GO_FILE"
+run git commit -m "temp(demo): change A"
+SHA_A="$(git rev-parse --short HEAD)"
+run bash -c "echo '// temp B' >> '$GO_FILE'"
+run git add "$GO_FILE"
+run git commit -m "temp(demo): change B"
+SHA_B="$(git rev-parse --short HEAD)"
+echo "Created commits: $SHA_A, $SHA_B"
+
+run git revert -n "$SHA_A" "$SHA_B"
+run git status --porcelain
+run git commit -m "Revert temp changes A and B (bundled)"
+
+run git log --oneline -n 6
+
+echo -e "\n--- Scenario 4: git reset ---"
+# Create a cleanup branch and experiment with resets
+run git checkout -b "$BR_CLEANUP" "$DEFAULT_BRANCH"
+
+# Make a commit to undo with --soft
+run bash -c "echo '// cleanup attempt 1' >> '$GO_FILE'"
+run git add "$GO_FILE"
+run git commit -m "cleanup(demo): attempt 1"
+run git log --oneline -n 3
+
+echo -e "\nPerform git reset --soft HEAD~1 (undo commit but keep changes staged):"
+run git reset --soft HEAD~1
+echo "After --soft reset, git status:"
+run git status --porcelain
+
+echo -e "\nRecommit after soft reset:"
+run git commit -m "cleanup(demo): attempt 1 (reworked after soft reset)"
+run git log --oneline -n 3
+
+echo -e "\nMake another commit then perform mixed reset (default) to unstage:"
+run bash -c "echo '// cleanup attempt 2' >> '$GO_FILE'"
+run git add "$GO_FILE"
+run git commit -m "cleanup(demo): attempt 2"
+run git log --oneline -n 3
+
+run git reset HEAD~1
+echo "After --mixed reset, git status (changes unstaged):"
+run git status --porcelain
+
+echo -e "\nDemonstrate git reset --hard to discard last commit."
+run bash -c "echo '// temp to be discarded' >> '$GO_FILE'"
+run git add "$GO_FILE"
+run git commit -m "temp(demo): to be discarded"
+DISC_SHA="$(git rev-parse --short HEAD)"
+echo "Created commit to discard: $DISC_SHA"
+run git log --oneline -n 3
+
+echo -e "\nReset --hard to parent (this discards commit and working tree changes):"
+run git reset --hard HEAD~1
+echo "After --hard reset, recent log:"
+run git log --oneline -n 3
+echo "Working tree status:"
+run git status --porcelain || true
+
+echo -e "\nReflog (useful to recover discarded commits):"
+run git reflog -n 10
+
+echo -e "\n--- Demo finished ---"
+echo "Branches created:"
+git branch --list "$BR_FEATURE" "$BR_HOTFIX" "$BR_RELEASE" "$BR_CLEANUP" || true
+echo "You can inspect these branches and the commits made locally. No pushes were performed."
+echo "If you want to cleanup demo branches, delete them manually, e.g.:"
+echo "  git branch -D $BR_FEATURE $BR_HOTFIX $BR_RELEASE $BR_CLEANUP"
+
+#!/usr/bin/env bash
+# run-git-advanced-on-SetupOrion.sh
+# Demo: git stash, cherry-pick, revert, reset inside an existing clone of fairul68/SetupOrion
+# Usage: bash run-git-advanced-on-SetupOrion.sh
+# Safety: Run in a throwaway clone. Script will create branches and commits locally but will NOT push.
+
+set -euo pipefail
+
+# Helpers
+run() {
+  echo -e "\n$ $*"
+  "$@"
+}
+run_allow_fail() {
+  echo -e "\n$ $*"
+  if "$@"; then
+    :
+  else
+    echo "== Command exited non-zero (expected in some scenarios) =="
+  fi
+}
+
+# Basic checks
+if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  echo "ERROR: not inside a git repository. cd into your local clone of fairul68/SetupOrion and rerun."
+  exit 1
+fi
+
+# Verify remote is fairul68/SetupOrion
+ORIGIN_URL="$(git config --get remote.origin.url || true)"
+if [ -z "$ORIGIN_URL" ]; then
+  echo "ERROR: no 'origin' remote configured. Please run this in a clone of fairul68/SetupOrion."
+  exit 1
+fi
+
+# Normalize to check repo name presence
+if [[ "$ORIGIN_URL" != *"fairul68/SetupOrion"* && "$ORIGIN_URL" != *":fairul68/SetupOrion.git"* && "$ORIGIN_URL" != *"/fairul68/SetupOrion.git"* ]]; then
+  echo "ERROR: remote origin does not look like fairul68/SetupOrion:"
+  echo "  origin: $ORIGIN_URL"
+  echo "This script will only run against the fairul68/SetupOrion repo to avoid accidental edits."
+  exit 1
+fi
+
+# Ensure working tree is clean unless user overrides
+if [ -n "$(git status --porcelain)" ] && [ "${SKIP_CLEAN_CHECK:-0}" != "1" ]; then
+  echo "ERROR: working tree is not clean. Commit or stash changes before running, or set SKIP_CLEAN_CHECK=1 to override."
+  git status --short
+  exit 1
+fi
+
+# Determine default branch name (remote HEAD)
+DEFAULT_BRANCH="$(git remote show origin 2>/dev/null | awk -F': ' '/HEAD branch/ {print $2}')"
+if [ -z "$DEFAULT_BRANCH" ]; then
+  # fallback guesses
+  if git show-ref --verify --quiet refs/heads/main; then
+    DEFAULT_BRANCH="main"
+  elif git show-ref --verify --quiet refs/heads/master; then
+    DEFAULT_BRANCH="master"
+  else
+    DEFAULT_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+  fi
+fi
+
+echo "Detected default branch: $DEFAULT_BRANCH"
+echo "Origin URL: $ORIGIN_URL"
+
+# Choose files from repository to work with
+SHELL_FILE="$(git ls-files '*.sh' | head -n 1 || true)"
+GO_FILE="$(git ls-files '*.go' | head -n 1 || true)"
+
+# If no suitable files found, create demo files under demo/ to avoid touching unrelated source.
+if [ -z "$SHELL_FILE" ] || [ -z "$GO_FILE" ]; then
+  echo "No existing .sh or .go files found in tracked files; creating demo/demo_install.sh and demo/cmd/main.go"
+  run mkdir -p demo cmd
+  SHELL_FILE="demo/demo_install.sh"
+  GO_FILE="demo/cmd/main.go"
+  if [ ! -f "$SHELL_FILE" ]; then
+    cat > "$SHELL_FILE" <<'EOF'
+#!/bin/bash
+echo "install script v1"
+EOF
+    chmod +x "$SHELL_FILE"
+    git add "$SHELL_FILE"
+  fi
+  if [ ! -f "$GO_FILE" ]; then
+    mkdir -p "$(dirname "$GO_FILE")"
+    cat > "$GO_FILE" <<'EOF'
+package main
+
+import "fmt"
+
+func main() {
+    fmt.Println("server v1")
+}
+EOF
+    git add "$GO_FILE"
+  fi
+  run git commit -m "demo(files): add demo shell and go files for local advanced-git demo" || true
+else
+  echo "Using existing files:"
+  echo "  shell file: $SHELL_FILE"
+  echo "  go file:    $GO_FILE"
+fi
+
+TIMESTAMP="$(date +%s)"
+BR_FEATURE="feature/refactor-demo-$TIMESTAMP"
+BR_HOTFIX="hotfix/demo-$TIMESTAMP"
+BR_RELEASE="release/demo-$TIMESTAMP"
+BR_CLEANUP="feature/cleanup-demo-$TIMESTAMP"
+
+echo -e "\n--- Scenario 1: git stash ---"
+run git checkout -b "$BR_FEATURE" "origin/$DEFAULT_BRANCH" || git checkout -b "$BR_FEATURE" "$DEFAULT_BRANCH"
+
+# Make tracked changes + untracked file
+echo -e "\n# refactor: demo change" >> "$SHELL_FILE"
+echo -e "\n// TODO: demo change" >> "$GO_FILE"
+UNTRACKED_FILE="scripts/demo_temp_$TIMESTAMP.sh"
+echo "# temporary helper" > "$UNTRACKED_FILE"
+chmod +x "$UNTRACKED_FILE"
+
+echo -e "\nWorking tree before stash (porcelain):"
+run git status --porcelain
+
+echo -e "\nStash including untracked files with message:"
+run git stash push -m "WIP: refactor demo $TIMESTAMP" -u
+
+echo -e "\nStash list:"
+run git stash list
+
+echo -e "\nWorking tree after stash (should be clean):"
+run git status --porcelain || true
+
+echo -e "\nSwitch to default branch and back (safe to run other checks):"
+run git checkout "$DEFAULT_BRANCH"
+run git checkout "$BR_FEATURE"
+
+echo -e "\nRestore stash (pop):"
+run git stash pop
+
+echo -e "\nStatus after pop:"
+run git status --porcelain
+run git log --oneline --graph -n 5
+
+echo -e "\n--- Scenario 2: git cherry-pick ---"
+# Create hotfix branch from default and commit a small fix to shell file
+run git checkout "$DEFAULT_BRANCH"
+run git checkout -b "$BR_HOTFIX"
+
+# Ensure we have the shell file tracked (exists)
+if [ ! -f "$SHELL_FILE" ]; then
+  echo "ERROR: shell file '$SHELL_FILE' unexpectedly missing."
+  exit 1
+fi
+
+run bash -c "cp '$SHELL_FILE' '${SHELL_FILE}.bak.$TIMESTAMP' || true"
+# Modify shell file for hotfix commit
+run bash -c "echo '# hotfix: adjust message' >> '$SHELL_FILE'"
+run git add "$SHELL_FILE"
+run git commit -m "hotfix(demo): small fix to $SHELL_FILE"
+HOTFIX_SHA="$(git rev-parse HEAD)"
+echo "Hotfix commit SHA: $HOTFIX_SHA"
+
+# Create a release branch and make a conflicting change to the same shell file
+run git checkout "$DEFAULT_BRANCH"
+run git checkout -b "$BR_RELEASE"
+run bash -c "echo '# release tweak' >> '$SHELL_FILE'"
+run git add "$SHELL_FILE"
+run git commit -m "release(demo): tweak $SHELL_FILE on release branch"
+
+echo -e "\nAttempting to cherry-pick hotfix onto release (expect conflict):"
+run_allow_fail git cherry-pick "$HOTFIX_SHA"
+
+echo -e "\nGit status after cherry-pick attempt (shows conflict when it occurs):"
+run git status --porcelain || true
+
+echo -e "\nResolving conflict by choosing cherry-picked changes (theirs) for the shell file, then continuing:"
+run git checkout --theirs -- "$SHELL_FILE"
+run git add "$SHELL_FILE"
+run git cherry-pick --continue
+
+echo -e "\nCherry-pick complete; recent log on $BR_RELEASE:"
+run git log --oneline --graph -n 6
+
+echo -e "\n--- Scenario 3: git revert ---"
+# Create a "bad" commit on default branch and revert it
+run git checkout "$DEFAULT_BRANCH"
+BAD_COMMIT_BRANCH="tmp/bad-change-$TIMESTAMP"
+run git checkout -b "$BAD_COMMIT_BRANCH"
+
+# Add a breaking line to the Go file
+run bash -c "echo '// EXPERIMENTAL: breaking' >> '$GO_FILE'"
+run git add "$GO_FILE"
+run git commit -m "experiment(demo): add breaking change to $GO_FILE"
+BAD_SHA="$(git rev-parse --short HEAD)"
+echo "Created bad commit: $BAD_SHA"
+
+echo -e "\nReverting the bad commit (non-interactive):"
+run git revert --no-edit "$(git rev-parse HEAD)"
+
+echo -e "\nLog after revert (you should see the revert commit):"
+run git log --oneline -n 6
+
+echo -e "\nDemonstrating bundled revert of multiple commits:"
+# Create two small commits then revert them together with -n
+run bash -c "echo '// temp A' >> '$GO_FILE'"
+run git add "$GO_FILE"
+run git commit -m "temp(demo): change A"
+SHA_A="$(git rev-parse --short HEAD)"
+run bash -c "echo '// temp B' >> '$GO_FILE'"
+run git add "$GO_FILE"
+run git commit -m "temp(demo): change B"
+SHA_B="$(git rev-parse --short HEAD)"
+echo "Created commits: $SHA_A, $SHA_B"
+
+run git revert -n "$SHA_A" "$SHA_B"
+run git status --porcelain
+run git commit -m "Revert temp changes A and B (bundled)"
+
+run git log --oneline -n 6
+
+echo -e "\n--- Scenario 4: git reset ---"
+# Create a cleanup branch and experiment with resets
+run git checkout -b "$BR_CLEANUP" "$DEFAULT_BRANCH"
+
+# Make a commit to undo with --soft
+run bash -c "echo '// cleanup attempt 1' >> '$GO_FILE'"
+run git add "$GO_FILE"
+run git commit -m "cleanup(demo): attempt 1"
+run git log --oneline -n 3
+
+echo -e "\nPerform git reset --soft HEAD~1 (undo commit but keep changes staged):"
+run git reset --soft HEAD~1
+echo "After --soft reset, git status:"
+run git status --porcelain
+
+echo -e "\nRecommit after soft reset:"
+run git commit -m "cleanup(demo): attempt 1 (reworked after soft reset)"
+run git log --oneline -n 3
+
+echo -e "\nMake another commit then perform mixed reset (default) to unstage:"
+run bash -c "echo '// cleanup attempt 2' >> '$GO_FILE'"
+run git add "$GO_FILE"
+run git commit -m "cleanup(demo): attempt 2"
+run git log --oneline -n 3
+
+run git reset HEAD~1
+echo "After --mixed reset, git status (changes unstaged):"
+run git status --porcelain
+
+echo -e "\nDemonstrate git reset --hard to discard last commit."
+run bash -c "echo '// temp to be discarded' >> '$GO_FILE'"
+run git add "$GO_FILE"
+run git commit -m "temp(demo): to be discarded"
+DISC_SHA="$(git rev-parse --short HEAD)"
+echo "Created commit to discard: $DISC_SHA"
+run git log --oneline -n 3
+
+echo -e "\nReset --hard to parent (this discards commit and working tree changes):"
+run git reset --hard HEAD~1
+echo "After --hard reset, recent log:"
+run git log --oneline -n 3
+echo "Working tree status:"
+run git status --porcelain || true
+
+echo -e "\nReflog (useful to recover discarded commits):"
+run git reflog -n 10
+
+echo -e "\n--- Demo finished ---"
+echo "Branches created:"
+git branch --list "$BR_FEATURE" "$BR_HOTFIX" "$BR_RELEASE" "$BR_CLEANUP" || true
+echo "You can inspect these branches and the commits made locally. No pushes were performed."
+echo "If you want to cleanup demo branches, delete them manually, e.g.:"
+echo "  git branch -D $BR_FEATURE $BR_HOTFIX $BR_RELEASE $BR_CLEANUP"
+
+exit 0exit 0#!/usr/bin/env bash
+# run-git-advanced-on-SetupOrion.sh
+# Demo: git stash, cherry-pick, revert, reset inside an existing clone of fairul68/SetupOrion
+# Usage: bash run-git-advanced-on-SetupOrion.sh
+# Safety: Run in a throwaway clone. Script will create branches and commits locally but will NOT push.
+
+set -euo pipefail
+
+# Helpers
+run() {
+  echo -e "\n$ $*"
+  "$@"
+}
+run_allow_fail() {
+  echo -e "\n$ $*"
+  if "$@"; then
+    :
+  else
+    echo "== Command exited non-zero (expected in some scenarios) =="
+  fi
+}
+
+# Basic checks
+if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  echo "ERROR: not inside a git repository. cd into your local clone of fairul68/SetupOrion and rerun."
+  exit 1
+fi
+
+# Verify remote is fairul68/SetupOrion
+ORIGIN_URL="$(git config --get remote.origin.url || true)"
+if [ -z "$ORIGIN_URL" ]; then
+  echo "ERROR: no 'origin' remote configured. Please run this in a clone of fairul68/SetupOrion."
+  exit 1
+fi
+
+# Normalize to check repo name presence
+if [[ "$ORIGIN_URL" != *"fairul68/SetupOrion"* && "$ORIGIN_URL" != *":fairul68/SetupOrion.git"* && "$ORIGIN_URL" != *"/fairul68/SetupOrion.git"* ]]; then
+  echo "ERROR: remote origin does not look like fairul68/SetupOrion:"
+  echo "  origin: $ORIGIN_URL"
+  echo "This script will only run against the fairul68/SetupOrion repo to avoid accidental edits."
+  exit 1
+fi
+
+# Ensure working tree is clean unless user overrides
+if [ -n "$(git status --porcelain)" ] && [ "${SKIP_CLEAN_CHECK:-0}" != "1" ]; then
+  echo "ERROR: working tree is not clean. Commit or stash changes before running, or set SKIP_CLEAN_CHECK=1 to override."
+  git status --short
+  exit 1
+fi
+
+# Determine default branch name (remote HEAD)
+DEFAULT_BRANCH="$(git remote show origin 2>/dev/null | awk -F': ' '/HEAD branch/ {print $2}')"
+if [ -z "$DEFAULT_BRANCH" ]; then
+  # fallback guesses
+  if git show-ref --verify --quiet refs/heads/main; then
+    DEFAULT_BRANCH="main"
+  elif git show-ref --verify --quiet refs/heads/master; then
+    DEFAULT_BRANCH="master"
+  else
+    DEFAULT_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+  fi
+fi
+
+echo "Detected default branch: $DEFAULT_BRANCH"
+echo "Origin URL: $ORIGIN_URL"
+
+# Choose files from repository to work with
+SHELL_FILE="$(git ls-files '*.sh' | head -n 1 || true)"
+GO_FILE="$(git ls-files '*.go' | head -n 1 || true)"
+
+# If no suitable files found, create demo files under demo/ to avoid touching unrelated source.
+if [ -z "$SHELL_FILE" ] || [ -z "$GO_FILE" ]; then
+  echo "No existing .sh or .go files found in tracked files; creating demo/demo_install.sh and demo/cmd/main.go"
+  run mkdir -p demo cmd
+  SHELL_FILE="demo/demo_install.sh"
+  GO_FILE="demo/cmd/main.go"
+  if [ ! -f "$SHELL_FILE" ]; then
+    cat > "$SHELL_FILE" <<'EOF'
+#!/bin/bash
+echo "install script v1"
+EOF
+    chmod +x "$SHELL_FILE"
+    git add "$SHELL_FILE"
+  fi
+  if [ ! -f "$GO_FILE" ]; then
+    mkdir -p "$(dirname "$GO_FILE")"
+    cat > "$GO_FILE" <<'EOF'
+package main
+
+import "fmt"
+
+func main() {
+    fmt.Println("server v1")
+}
+EOF
+    git add "$GO_FILE"
+  fi
+  run git commit -m "demo(files): add demo shell and go files for local advanced-git demo" || true
+else
+  echo "Using existing files:"
+  echo "  shell file: $SHELL_FILE"
+  echo "  go file:    $GO_FILE"
+fi
+
+TIMESTAMP="$(date +%s)"
+BR_FEATURE="feature/refactor-demo-$TIMESTAMP"
+BR_HOTFIX="hotfix/demo-$TIMESTAMP"
+BR_RELEASE="release/demo-$TIMESTAMP"
+BR_CLEANUP="feature/cleanup-demo-$TIMESTAMP"
+
+echo -e "\n--- Scenario 1: git stash ---"
+run git checkout -b "$BR_FEATURE" "origin/$DEFAULT_BRANCH" || git checkout -b "$BR_FEATURE" "$DEFAULT_BRANCH"
+
+# Make tracked changes + untracked file
+echo -e "\n# refactor: demo change" >> "$SHELL_FILE"
+echo -e "\n// TODO: demo change" >> "$GO_FILE"
+UNTRACKED_FILE="scripts/demo_temp_$TIMESTAMP.sh"
+echo "# temporary helper" > "$UNTRACKED_FILE"
+chmod +x "$UNTRACKED_FILE"
+
+echo -e "\nWorking tree before stash (porcelain):"
+run git status --porcelain
+
+echo -e "\nStash including untracked files with message:"
+run git stash push -m "WIP: refactor demo $TIMESTAMP" -u
+
+echo -e "\nStash list:"
+run git stash list
+
+echo -e "\nWorking tree after stash (should be clean):"
+run git status --porcelain || true
+
+echo -e "\nSwitch to default branch and back (safe to run other checks):"
+run git checkout "$DEFAULT_BRANCH"
+run git checkout "$BR_FEATURE"
+
+echo -e "\nRestore stash (pop):"
+run git stash pop
+
+echo -e "\nStatus after pop:"
+run git status --porcelain
+run git log --oneline --graph -n 5
+
+echo -e "\n--- Scenario 2: git cherry-pick ---"
+# Create hotfix branch from default and commit a small fix to shell file
+run git checkout "$DEFAULT_BRANCH"
+run git checkout -b "$BR_HOTFIX"
+
+# Ensure we have the shell file tracked (exists)
+if [ ! -f "$SHELL_FILE" ]; then
+  echo "ERROR: shell file '$SHELL_FILE' unexpectedly missing."
+  exit 1
+fi
+
+run bash -c "cp '$SHELL_FILE' '${SHELL_FILE}.bak.$TIMESTAMP' || true"
+# Modify shell file for hotfix commit
+run bash -c "echo '# hotfix: adjust message' >> '$SHELL_FILE'"
+run git add "$SHELL_FILE"
+run git commit -m "hotfix(demo): small fix to $SHELL_FILE"
+HOTFIX_SHA="$(git rev-parse HEAD)"
+echo "Hotfix commit SHA: $HOTFIX_SHA"
+
+# Create a release branch and make a conflicting change to the same shell file
+run git checkout "$DEFAULT_BRANCH"
+run git checkout -b "$BR_RELEASE"
+run bash -c "echo '# release tweak' >> '$SHELL_FILE'"
+run git add "$SHELL_FILE"
+run git commit -m "release(demo): tweak $SHELL_FILE on release branch"
+
+echo -e "\nAttempting to cherry-pick hotfix onto release (expect conflict):"
+run_allow_fail git cherry-pick "$HOTFIX_SHA"
+
+echo -e "\nGit status after cherry-pick attempt (shows conflict when it occurs):"
+run git status --porcelain || true
+
+echo -e "\nResolving conflict by choosing cherry-picked changes (theirs) for the shell file, then continuing:"
+run git checkout --theirs -- "$SHELL_FILE"
+run git add "$SHELL_FILE"
+run git cherry-pick --continue
+
+echo -e "\nCherry-pick complete; recent log on $BR_RELEASE:"
+run git log --oneline --graph -n 6
+
+echo -e "\n--- Scenario 3: git revert ---"
+# Create a "bad" commit on default branch and revert it
+run git checkout "$DEFAULT_BRANCH"
+BAD_COMMIT_BRANCH="tmp/bad-change-$TIMESTAMP"
+run git checkout -b "$BAD_COMMIT_BRANCH"
+
+# Add a breaking line to the Go file
+run bash -c "echo '// EXPERIMENTAL: breaking' >> '$GO_FILE'"
+run git add "$GO_FILE"
+run git commit -m "experiment(demo): add breaking change to $GO_FILE"
+BAD_SHA="$(git rev-parse --short HEAD)"
+echo "Created bad commit: $BAD_SHA"
+
+echo -e "\nReverting the bad commit (non-interactive):"
+run git revert --no-edit "$(git rev-parse HEAD)"
+
+echo -e "\nLog after revert (you should see the revert commit):"
+run git log --oneline -n 6
+
+echo -e "\nDemonstrating bundled revert of multiple commits:"
+# Create two small commits then revert them together with -n
+run bash -c "echo '// temp A' >> '$GO_FILE'"
+run git add "$GO_FILE"
+run git commit -m "temp(demo): change A"
+SHA_A="$(git rev-parse --short HEAD)"
+run bash -c "echo '// temp B' >> '$GO_FILE'"
+run git add "$GO_FILE"
+run git commit -m "temp(demo): change B"
+SHA_B="$(git rev-parse --short HEAD)"
+echo "Created commits: $SHA_A, $SHA_B"
+
+run git revert -n "$SHA_A" "$SHA_B"
+run git status --porcelain
+run git commit -m "Revert temp changes A and B (bundled)"
+
+run git log --oneline -n 6
+
+echo -e "\n--- Scenario 4: git reset ---"
+# Create a cleanup branch and experiment with resets
+run git checkout -b "$BR_CLEANUP" "$DEFAULT_BRANCH"
+
+# Make a commit to undo with --soft
+run bash -c "echo '// cleanup attempt 1' >> '$GO_FILE'"
+run git add "$GO_FILE"
+run git commit -m "cleanup(demo): attempt 1"
+run git log --oneline -n 3
+
+echo -e "\nPerform git reset --soft HEAD~1 (undo commit but keep changes staged):"
+run git reset --soft HEAD~1
+echo "After --soft reset, git status:"
+run git status --porcelain
+
+echo -e "\nRecommit after soft reset:"
+run git commit -m "cleanup(demo): attempt 1 (reworked after soft reset)"
+run git log --oneline -n 3
+
+echo -e "\nMake another commit then perform mixed reset (default) to unstage:"
+run bash -c "echo '// cleanup attempt 2' >> '$GO_FILE'"
+run git add "$GO_FILE"
+run git commit -m "cleanup(demo): attempt 2"
+run git log --oneline -n 3
+
+run git reset HEAD~1
+echo "After --mixed reset, git status (changes unstaged):"
+run git status --porcelain
+
+echo -e "\nDemonstrate git reset --hard to discard last commit."
+run bash -c "echo '// temp to be discarded' >> '$GO_FILE'"
+run git add "$GO_FILE"
+run git commit -m "temp(demo): to be discarded"
+DISC_SHA="$(git rev-parse --short HEAD)"
+echo "Created commit to discard: $DISC_SHA"
+run git log --oneline -n 3
+
+echo -e "\nReset --hard to parent (this discards commit and working tree changes):"
+run git reset --hard HEAD~1
+echo "After --hard reset, recent log:"
+run git log --oneline -n 3
+echo "Working tree status:"
+run git status --porcelain || true
+
+echo -e "\nReflog (useful to recover discarded commits):"
+run git reflog -n 10
+
+echo -e "\n--- Demo finished ---"
+echo "Branches created:"
+git branch --list "$BR_FEATURE" "$BR_HOTFIX" "$BR_RELEASE" "$BR_CLEANUP" || true
+echo "You can inspect these branches and the commits made locally. No pushes were performed."
+echo "If you want to cleanup demo branches, delete them manually, e.g.:"
+echo "  git branch -D $BR_FEATURE $BR_HOTFIX $BR_RELEASE $BR_CLEANUP"
+
+exit 0
